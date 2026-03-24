@@ -1,3 +1,30 @@
+//! fermi-term — a fast, dependency-minimal terminal emulator written in Rust.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │  main.rs  —  event loop, keyboard input, frame timing   │
+//! │                                                         │
+//! │  ┌──────────────┐        ┌───────────────────────────┐  │
+//! │  │ terminal.rs  │        │      renderer.rs          │  │
+//! │  │              │        │                           │  │
+//! │  │  Grid        │◄──────►│  fontdue rasterisation    │  │
+//! │  │  Cell        │        │  pixel-buffer compositing │  │
+//! │  │  VTE Perform │        │                           │  │
+//! │  └──────┬───────┘        └───────────────────────────┘  │
+//! │         │                                               │
+//! │  ┌──────▼───────┐                                       │
+//! │  │  portable-pty│  ←  shell process (bash/zsh/fish)     │
+//! │  └──────────────┘                                       │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! The PTY reader runs on a background thread and feeds bytes into the
+//! VTE parser, which updates the shared [`terminal::Grid`] via a `Mutex`.
+//! The main thread owns the minifb window, polls for key events, writes
+//! input bytes to the PTY master, and re-renders the grid every frame.
+
 mod terminal;
 mod renderer;
 

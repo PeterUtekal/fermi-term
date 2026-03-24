@@ -1,9 +1,22 @@
 /// A single character cell in the terminal grid.
+///
+/// Each cell stores the displayed character along with its foreground
+/// and background colours and the bold attribute. The `bold` field is
+/// stored so that future renderers (e.g. a GPU path with a bold font
+/// variant) can use it without a schema migration.
 #[derive(Clone, Debug)]
 pub struct Cell {
+    /// The Unicode scalar displayed in this cell.
     pub c: char,
+    /// Foreground colour as `[R, G, B]`.
     pub fg: [u8; 3],
+    /// Background colour as `[R, G, B]`.
     pub bg: [u8; 3],
+    /// Whether the cell should be rendered in bold weight.
+    ///
+    /// Stored for future use; the current CPU renderer does not yet
+    /// load a separate bold font variant.
+    #[allow(dead_code)]
     pub bold: bool,
 }
 
@@ -19,15 +32,32 @@ impl Default for Cell {
 }
 
 /// The terminal grid holding the cell matrix and cursor state.
+///
+/// `cells` is always exactly `rows × cols`. When the cursor reaches
+/// the last row, `scroll_up` shifts every row up by one and appends
+/// a blank row at the bottom, giving basic terminal scrolling.
+///
+/// `scrollback_offset` is reserved for the forthcoming scrollback
+/// buffer: it will record how many historical lines the view has been
+/// scrolled back by (0 = live, bottom-of-history view).
 pub struct Grid {
+    /// Number of columns (characters per line).
     pub cols: usize,
+    /// Number of visible rows.
     pub rows: usize,
+    /// The cell matrix, indexed as `cells[row][col]`.
     pub cells: Vec<Vec<Cell>>,
+    /// Current cursor column (0-indexed).
     pub cursor_x: usize,
+    /// Current cursor row (0-indexed).
     pub cursor_y: usize,
+    /// Lines scrolled back from the bottom (0 = live view).
+    ///
+    /// Reserved for the scrollback feature; not yet used by the renderer.
+    #[allow(dead_code)]
     pub scrollback_offset: usize,
 
-    // Current SGR state
+    // ── Current SGR (Select Graphic Rendition) state ──────────────────
     cur_fg: [u8; 3],
     cur_bg: [u8; 3],
     cur_bold: bool,
