@@ -1,0 +1,16 @@
+[package]
+name = "fermi-term"
+version = "0.1.0"
+edition = "2021"
+description = "The fastest, simplest terminal emulator. Written in Rust."
+license = "MIT"
+
+[[bin]]
+name = "fermi-term"
+path = "src/main.rs"
+
+[dependencies]
+minifb = "0.25"
+fontdue = "0.8"
+portable-pty = "0.8"
+vte = "0.11"
