@@ -13,10 +13,6 @@ pub struct Cell {
     /// Background colour as `[R, G, B]`.
     pub bg: [u8; 3],
     /// Whether the cell should be rendered in bold weight.
-    ///
-    /// Stored for future use; the current CPU renderer does not yet
-    /// load a separate bold font variant.
-    #[allow(dead_code)]
     pub bold: bool,
 }
 
@@ -33,29 +29,29 @@ impl Default for Cell {
 
 /// The terminal grid holding the cell matrix and cursor state.
 ///
-/// `cells` is always exactly `rows × cols`. When the cursor reaches
-/// the last row, `scroll_up` shifts every row up by one and appends
-/// a blank row at the bottom, giving basic terminal scrolling.
-///
-/// `scrollback_offset` is reserved for the forthcoming scrollback
-/// buffer: it will record how many historical lines the view has been
-/// scrolled back by (0 = live, bottom-of-history view).
+/// `cells` holds the full scrollback history. The visible region is always
+/// the last `rows` entries. When output scrolls the screen, new rows are
+/// appended and old rows are trimmed only when `cells.len() > rows + max_scrollback`.
 pub struct Grid {
     /// Number of columns (characters per line).
     pub cols: usize,
     /// Number of visible rows.
     pub rows: usize,
-    /// The cell matrix, indexed as `cells[row][col]`.
+    /// Full history including scrollback. Index 0 = oldest line.
+    /// Visible region is `cells[visible_start()..]` for `rows` lines.
     pub cells: Vec<Vec<Cell>>,
     /// Current cursor column (0-indexed).
     pub cursor_x: usize,
-    /// Current cursor row (0-indexed).
+    /// Cursor row relative to the visible region (not absolute history index).
     pub cursor_y: usize,
-    /// Lines scrolled back from the bottom (0 = live view).
-    ///
-    /// Reserved for the scrollback feature; not yet used by the renderer.
-    #[allow(dead_code)]
-    pub scrollback_offset: usize,
+    /// Lines scrolled back from the live view (0 = showing latest output).
+    pub scroll_offset: usize,
+    /// Maximum history lines retained above the visible area.
+    pub max_scrollback: usize,
+    /// Default foreground colour.
+    pub default_fg: [u8; 3],
+    /// Default background colour.
+    pub default_bg: [u8; 3],
 
     // ── Current SGR (Select Graphic Rendition) state ──────────────────
     cur_fg: [u8; 3],
@@ -64,19 +60,79 @@ pub struct Grid {
 }
 
 impl Grid {
-    pub fn new(cols: usize, rows: usize) -> Self {
-        let cells = vec![vec![Cell::default(); cols]; rows];
+    pub fn new(
+        cols: usize,
+        rows: usize,
+        max_scrollback: usize,
+        default_fg: [u8; 3],
+        default_bg: [u8; 3],
+    ) -> Self {
+        let cells = (0..rows)
+            .map(|_| {
+                vec![
+                    Cell {
+                        c: ' ',
+                        fg: default_fg,
+                        bg: default_bg,
+                        bold: false,
+                    };
+                    cols
+                ]
+            })
+            .collect();
         Grid {
             cols,
             rows,
             cells,
             cursor_x: 0,
             cursor_y: 0,
-            scrollback_offset: 0,
-            cur_fg: [200, 200, 200],
-            cur_bg: [14, 14, 26],
+            scroll_offset: 0,
+            max_scrollback,
+            default_fg,
+            default_bg,
+            cur_fg: default_fg,
+            cur_bg: default_bg,
             cur_bold: false,
         }
+    }
+
+    /// Index of the first visible row in `self.cells`.
+    pub fn visible_start(&self) -> usize {
+        let total = self.cells.len();
+        if total <= self.rows {
+            0
+        } else {
+            let live_start = total - self.rows;
+            live_start.saturating_sub(self.scroll_offset)
+        }
+    }
+
+    /// Scroll the view by `delta` lines (positive = scroll up / back in history).
+    pub fn scroll_view(&mut self, delta: isize) {
+        let total = self.cells.len();
+        let max_offset = total.saturating_sub(self.rows);
+        let new_offset = (self.scroll_offset as isize + delta)
+            .max(0)
+            .min(max_offset as isize) as usize;
+        self.scroll_offset = new_offset;
+    }
+
+    /// Jump to the live (bottom) view.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    #[allow(dead_code)]
+    fn blank_row(&self) -> Vec<Cell> {
+        vec![
+            Cell {
+                c: ' ',
+                fg: self.default_fg,
+                bg: self.default_bg,
+                bold: false,
+            };
+            self.cols
+        ]
     }
 
     fn current_cell(&self) -> Cell {
@@ -89,9 +145,53 @@ impl Grid {
     }
 
     fn scroll_up(&mut self) {
-        self.cells.remove(0);
+        // Append a blank row using current SGR colors
         let blank_row = vec![self.current_cell(); self.cols];
         self.cells.push(blank_row);
+        let max_total = self.rows + self.max_scrollback;
+        if self.cells.len() > max_total {
+            self.cells.drain(0..1);
+        }
+    }
+
+    /// Get a mutable reference to a cell in the live (visible) region.
+    fn visible_cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        let live_start = self.cells.len().saturating_sub(self.rows);
+        self.cells.get_mut(live_start + row)?.get_mut(col)
+    }
+
+    /// Resize the visible grid. Extends rows with blank lines, trims if smaller.
+    pub fn resize(&mut self, new_cols: usize, new_rows: usize) {
+        // Extend rows if needed
+        while self.cells.len() < new_rows {
+            let row = vec![
+                Cell {
+                    c: ' ',
+                    fg: self.default_fg,
+                    bg: self.default_bg,
+                    bold: false,
+                };
+                new_cols
+            ];
+            self.cells.push(row);
+        }
+        // Resize each row
+        for row in self.cells.iter_mut() {
+            row.resize(
+                new_cols,
+                Cell {
+                    c: ' ',
+                    fg: self.default_fg,
+                    bg: self.default_bg,
+                    bold: false,
+                },
+            );
+        }
+        // Clamp cursor
+        self.cursor_x = self.cursor_x.min(new_cols.saturating_sub(1));
+        self.cursor_y = self.cursor_y.min(new_rows.saturating_sub(1));
+        self.cols = new_cols;
+        self.rows = new_rows;
     }
 
     fn advance_cursor(&mut self) {
@@ -119,13 +219,14 @@ impl Grid {
 /// VTE Performer implementation for Grid.
 impl vte::Perform for Grid {
     fn print(&mut self, c: char) {
-        if self.cursor_y < self.rows && self.cursor_x < self.cols {
-            self.cells[self.cursor_y][self.cursor_x] = Cell {
-                c,
-                fg: self.cur_fg,
-                bg: self.cur_bg,
-                bold: self.cur_bold,
-            };
+        let cur_fg = self.cur_fg;
+        let cur_bg = self.cur_bg;
+        let cur_bold = self.cur_bold;
+        if let Some(cell) = self.visible_cell_mut(self.cursor_y, self.cursor_x) {
+            cell.c = c;
+            cell.fg = cur_fg;
+            cell.bg = cur_bg;
+            cell.bold = cur_bold;
         }
         self.advance_cursor();
     }
@@ -158,7 +259,14 @@ impl vte::Perform for Grid {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(
+        &mut self,
+        _params: &vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        _action: char,
+    ) {
+    }
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
@@ -172,7 +280,7 @@ impl vte::Perform for Grid {
     ) {
         // Collect params into a Vec<u16>
         let ps: Vec<u16> = params.iter().map(|p| p[0]).collect();
-        let p0 = ps.get(0).copied().unwrap_or(0);
+        let p0 = ps.first().copied().unwrap_or(0);
 
         match action {
             // Cursor Up
@@ -204,45 +312,58 @@ impl vte::Perform for Grid {
             }
             // Erase in Display
             'J' => {
+                let blank = self.current_cell();
+                let cx = self.cursor_x;
+                let cy = self.cursor_y;
+                let live_start = self.cells.len().saturating_sub(self.rows);
                 match p0 {
                     0 => {
                         // Erase from cursor to end of screen
-                        let blank = self.current_cell();
-                        let cx = self.cursor_x;
-                        let cy = self.cursor_y;
                         for x in cx..self.cols {
-                            if cy < self.rows {
-                                self.cells[cy][x] = blank.clone();
+                            if let Some(row) = self.cells.get_mut(live_start + cy) {
+                                if let Some(cell) = row.get_mut(x) {
+                                    *cell = blank.clone();
+                                }
                             }
                         }
                         for y in (cy + 1)..self.rows {
                             for x in 0..self.cols {
-                                self.cells[y][x] = blank.clone();
+                                if let Some(row) = self.cells.get_mut(live_start + y) {
+                                    if let Some(cell) = row.get_mut(x) {
+                                        *cell = blank.clone();
+                                    }
+                                }
                             }
                         }
                     }
                     1 => {
                         // Erase from start to cursor
-                        let blank = self.current_cell();
-                        let cx = self.cursor_x;
-                        let cy = self.cursor_y;
                         for y in 0..cy {
                             for x in 0..self.cols {
-                                self.cells[y][x] = blank.clone();
+                                if let Some(row) = self.cells.get_mut(live_start + y) {
+                                    if let Some(cell) = row.get_mut(x) {
+                                        *cell = blank.clone();
+                                    }
+                                }
                             }
                         }
-                        if cy < self.rows {
-                            for x in 0..=cx.min(self.cols - 1) {
-                                self.cells[cy][x] = blank.clone();
+                        for x in 0..=cx.min(self.cols - 1) {
+                            if let Some(row) = self.cells.get_mut(live_start + cy) {
+                                if let Some(cell) = row.get_mut(x) {
+                                    *cell = blank.clone();
+                                }
                             }
                         }
                     }
                     2 | 3 => {
                         // Erase entire display
-                        let blank = self.current_cell();
                         for y in 0..self.rows {
                             for x in 0..self.cols {
-                                self.cells[y][x] = blank.clone();
+                                if let Some(row) = self.cells.get_mut(live_start + y) {
+                                    if let Some(cell) = row.get_mut(x) {
+                                        *cell = blank.clone();
+                                    }
+                                }
                             }
                         }
                         if p0 == 2 {
@@ -258,28 +379,35 @@ impl vte::Perform for Grid {
                 let blank = self.current_cell();
                 let cx = self.cursor_x;
                 let cy = self.cursor_y;
+                let live_start = self.cells.len().saturating_sub(self.rows);
                 match p0 {
                     0 => {
                         // Erase from cursor to end of line
-                        if cy < self.rows {
+                        if let Some(row) = self.cells.get_mut(live_start + cy) {
                             for x in cx..self.cols {
-                                self.cells[cy][x] = blank.clone();
+                                if let Some(cell) = row.get_mut(x) {
+                                    *cell = blank.clone();
+                                }
                             }
                         }
                     }
                     1 => {
                         // Erase from start of line to cursor
-                        if cy < self.rows {
+                        if let Some(row) = self.cells.get_mut(live_start + cy) {
                             for x in 0..=cx.min(self.cols - 1) {
-                                self.cells[cy][x] = blank.clone();
+                                if let Some(cell) = row.get_mut(x) {
+                                    *cell = blank.clone();
+                                }
                             }
                         }
                     }
                     2 => {
                         // Erase entire line
-                        if cy < self.rows {
+                        if let Some(row) = self.cells.get_mut(live_start + cy) {
                             for x in 0..self.cols {
-                                self.cells[cy][x] = blank.clone();
+                                if let Some(cell) = row.get_mut(x) {
+                                    *cell = blank.clone();
+                                }
                             }
                         }
                     }
@@ -312,9 +440,9 @@ impl vte::Perform for Grid {
                 let n = p0.max(1) as usize;
                 let cy = self.cursor_y;
                 let cx = self.cursor_x;
-                if cy < self.rows {
-                    let blank = self.current_cell();
-                    let row = &mut self.cells[cy];
+                let blank = self.current_cell();
+                let live_start = self.cells.len().saturating_sub(self.rows);
+                if let Some(row) = self.cells.get_mut(live_start + cy) {
                     for i in cx..self.cols {
                         if i + n < self.cols {
                             row[i] = row[i + n].clone();
@@ -334,11 +462,13 @@ impl vte::Perform for Grid {
             // Scroll Down
             'T' => {
                 let n = p0.max(1) as usize;
+                let live_start = self.cells.len().saturating_sub(self.rows);
                 for _ in 0..n {
-                    // insert blank line at top
+                    // insert blank line at live view top
                     let blank_row = vec![self.current_cell(); self.cols];
-                    self.cells.insert(0, blank_row);
-                    if self.cells.len() > self.rows {
+                    self.cells.insert(live_start, blank_row);
+                    // remove the last row if we've gone over `rows`
+                    if self.cells.len() > self.rows + self.max_scrollback {
                         self.cells.pop();
                     }
                 }
@@ -348,9 +478,9 @@ impl vte::Perform for Grid {
                 let n = p0.max(1) as usize;
                 let cy = self.cursor_y;
                 let cx = self.cursor_x;
-                if cy < self.rows {
-                    let blank = self.current_cell();
-                    let row = &mut self.cells[cy];
+                let blank = self.current_cell();
+                let live_start = self.cells.len().saturating_sub(self.rows);
+                if let Some(row) = self.cells.get_mut(live_start + cy) {
                     for i in (cx..self.cols).rev() {
                         if i >= cx + n {
                             row[i] = row[i - n].clone();
@@ -374,28 +504,27 @@ impl Grid {
     fn apply_sgr(&mut self, params: &[u16]) {
         // Standard ANSI 256-color table (first 16 colors)
         const ANSI_COLORS: [[u8; 3]; 16] = [
-            [0,   0,   0  ], // 0  Black
-            [170, 0,   0  ], // 1  Red
-            [0,   170, 0  ], // 2  Green
-            [170, 170, 0  ], // 3  Yellow
-            [0,   0,   170], // 4  Blue
-            [170, 0,   170], // 5  Magenta
-            [0,   170, 170], // 6  Cyan
+            [0, 0, 0],       // 0  Black
+            [170, 0, 0],     // 1  Red
+            [0, 170, 0],     // 2  Green
+            [170, 170, 0],   // 3  Yellow
+            [0, 0, 170],     // 4  Blue
+            [170, 0, 170],   // 5  Magenta
+            [0, 170, 170],   // 6  Cyan
             [170, 170, 170], // 7  White
-            [85,  85,  85 ], // 8  Bright Black (Gray)
-            [255, 85,  85 ], // 9  Bright Red
-            [85,  255, 85 ], // 10 Bright Green
-            [255, 255, 85 ], // 11 Bright Yellow
-            [85,  85,  255], // 12 Bright Blue
-            [255, 85,  255], // 13 Bright Magenta
-            [85,  255, 255], // 14 Bright Cyan
+            [85, 85, 85],    // 8  Bright Black (Gray)
+            [255, 85, 85],   // 9  Bright Red
+            [85, 255, 85],   // 10 Bright Green
+            [255, 255, 85],  // 11 Bright Yellow
+            [85, 85, 255],   // 12 Bright Blue
+            [255, 85, 255],  // 13 Bright Magenta
+            [85, 255, 255],  // 14 Bright Cyan
             [255, 255, 255], // 15 Bright White
         ];
 
         if params.is_empty() {
-            // Reset
-            self.cur_fg = [200, 200, 200];
-            self.cur_bg = [14, 14, 26];
+            self.cur_fg = self.default_fg;
+            self.cur_bg = self.default_bg;
             self.cur_bold = false;
             return;
         }
@@ -404,8 +533,8 @@ impl Grid {
         while i < params.len() {
             match params[i] {
                 0 => {
-                    self.cur_fg = [200, 200, 200];
-                    self.cur_bg = [14, 14, 26];
+                    self.cur_fg = self.default_fg;
+                    self.cur_bg = self.default_bg;
                     self.cur_bold = false;
                 }
                 1 => self.cur_bold = true,
@@ -437,7 +566,7 @@ impl Grid {
                         }
                     }
                 }
-                39 => self.cur_fg = [200, 200, 200], // Default fg
+                39 => self.cur_fg = self.default_fg, // Default fg
                 // Normal background colors
                 40..=47 => {
                     let idx = (params[i] - 40) as usize;
@@ -464,7 +593,7 @@ impl Grid {
                         }
                     }
                 }
-                49 => self.cur_bg = [14, 14, 26], // Default bg
+                49 => self.cur_bg = self.default_bg, // Default bg
                 // Bright foreground colors
                 90..=97 => {
                     let idx = (params[i] - 90 + 8) as usize;
@@ -485,21 +614,21 @@ impl Grid {
 /// Convert a 256-color ANSI index to RGB.
 fn ansi_256_color(n: usize) -> [u8; 3] {
     const ANSI_16: [[u8; 3]; 16] = [
-        [0,   0,   0  ],
-        [170, 0,   0  ],
-        [0,   170, 0  ],
-        [170, 170, 0  ],
-        [0,   0,   170],
-        [170, 0,   170],
-        [0,   170, 170],
+        [0, 0, 0],
+        [170, 0, 0],
+        [0, 170, 0],
+        [170, 170, 0],
+        [0, 0, 170],
+        [170, 0, 170],
+        [0, 170, 170],
         [170, 170, 170],
-        [85,  85,  85 ],
-        [255, 85,  85 ],
-        [85,  255, 85 ],
-        [255, 255, 85 ],
-        [85,  85,  255],
-        [255, 85,  255],
-        [85,  255, 255],
+        [85, 85, 85],
+        [255, 85, 85],
+        [85, 255, 85],
+        [255, 255, 85],
+        [85, 85, 255],
+        [255, 85, 255],
+        [85, 255, 255],
         [255, 255, 255],
     ];
 
@@ -510,7 +639,13 @@ fn ansi_256_color(n: usize) -> [u8; 3] {
         let r = (n / 36) as u8;
         let g = ((n % 36) / 6) as u8;
         let b = (n % 6) as u8;
-        let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        let to_byte = |v: u8| {
+            if v == 0 {
+                0
+            } else {
+                55 + v * 40
+            }
+        };
         [to_byte(r), to_byte(g), to_byte(b)]
     } else {
         // Grayscale

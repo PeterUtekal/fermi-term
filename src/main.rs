@@ -1,310 +1,277 @@
-//! fermi-term — a fast, dependency-minimal terminal emulator written in Rust.
+//! fermi-term entry point.
+//!
+//! Initialises the PTY, spawns the shell, creates the window via winit,
+//! and drives the render + input loop until the window is closed.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │  main.rs  —  event loop, keyboard input, frame timing   │
-//! │                                                         │
-//! │  ┌──────────────┐        ┌───────────────────────────┐  │
-//! │  │ terminal.rs  │        │      renderer.rs          │  │
-//! │  │              │        │                           │  │
-//! │  │  Grid        │◄──────►│  fontdue rasterisation    │  │
-//! │  │  Cell        │        │  pixel-buffer compositing │  │
-//! │  │  VTE Perform │        │                           │  │
-//! │  └──────┬───────┘        └───────────────────────────┘  │
-//! │         │                                               │
-//! │  ┌──────▼───────┐                                       │
-//! │  │  portable-pty│  ←  shell process (bash/zsh/fish)     │
-//! │  └──────────────┘                                       │
-//! └─────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │  main.rs  —  winit event loop, PTY orchestration            │
+//! │                                                             │
+//! │  ┌──────────────┐        ┌──────────────────────────────┐   │
+//! │  │ terminal.rs  │        │      renderer.rs             │   │
+//! │  │              │        │                              │   │
+//! │  │  Grid        │◄──────►│  wgpu GPU renderer           │   │
+//! │  │  Cell        │        │  fontdue glyph atlas         │   │
+//! │  │  VTE Perform │        │  instanced draw calls        │   │
+//! │  └──────┬───────┘        └──────────────────────────────┘   │
+//! │         │                                                   │
+//! │  ┌──────▼───────┐                                           │
+//! │  │  portable-pty│  ←  shell process (bash/zsh/fish)         │
+//! │  └──────────────┘                                           │
+//! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! The PTY reader runs on a background thread and feeds bytes into the
 //! VTE parser, which updates the shared [`terminal::Grid`] via a `Mutex`.
-//! The main thread owns the minifb window, polls for key events, writes
+//! The main thread owns the winit/wgpu window, polls for key events, writes
 //! input bytes to the PTY master, and re-renders the grid every frame.
-
-mod terminal;
-mod renderer;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use minifb::{Key, KeyRepeat, Window, WindowOptions};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use winit::event::{ElementState, Event, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::WindowBuilder;
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vte::Parser;
 
-use terminal::Grid;
-use renderer::Renderer;
+mod config;
+mod renderer;
+mod terminal;
 
-const WIN_W: usize = 1200;
-const WIN_H: usize = 800;
-const TARGET_FPS: u64 = 60;
-const FRAME_DURATION: Duration = Duration::from_nanos(1_000_000_000 / TARGET_FPS);
+use config::Config;
+use terminal::Grid;
 
 fn main() {
-    // --- Initialize renderer first to get cell dimensions ---
-    let renderer = Renderer::new();
-    let cell_w = renderer.cell_w;
-    let cell_h = renderer.cell_h;
+    let config = Config::load();
 
-    let cols = WIN_W / cell_w;
-    let rows = WIN_H / cell_h;
-
-    eprintln!(
-        "[fermi-term] Grid: {}x{} cells (cell size: {}x{})",
-        cols, rows, cell_w, cell_h
-    );
-
-    // --- Initialize terminal grid ---
-    let grid = Arc::new(Mutex::new(Grid::new(cols, rows)));
-
-    // --- Spawn PTY ---
+    // ── Set up PTY ────────────────────────────────────────────────────
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
+            rows: 24,
+            cols: 80,
             pixel_width: 0,
             pixel_height: 0,
         })
         .expect("Failed to open PTY");
 
-    // Determine shell
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let mut cmd = CommandBuilder::new(&shell);
+    let mut cmd = CommandBuilder::new(&config.shell);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-
     let _child = pty_pair
         .slave
         .spawn_command(cmd)
         .expect("Failed to spawn shell");
 
-    // Get PTY reader (clone before taking writer)
-    let mut pty_reader = pty_pair
+    let pty_reader = pty_pair
         .master
         .try_clone_reader()
         .expect("Failed to clone PTY reader");
-
-    // Take the writer (can only be called once)
-    let pty_writer_box = pty_pair
+    let pty_writer: Box<dyn Write + Send> = pty_pair
         .master
         .take_writer()
         .expect("Failed to take PTY writer");
+    let master: Box<dyn portable_pty::MasterPty + Send> = pty_pair.master;
 
-    // PTY writer shared with main thread for keyboard input
-    let pty_writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(pty_writer_box));
+    let grid = Arc::new(Mutex::new(Grid::new(
+        80,
+        24,
+        config.scrollback_lines,
+        config.fg,
+        config.bg,
+    )));
 
-    // --- Background thread: read PTY output, parse VTE, update grid ---
+    // ── Background thread: PTY → VTE → Grid ──────────────────────────
     let grid_clone = Arc::clone(&grid);
     std::thread::spawn(move || {
         let mut parser = Parser::new();
         let mut buf = [0u8; 4096];
-
+        let mut reader = pty_reader;
         loop {
-            match pty_reader.read(&mut buf) {
-                Ok(0) => break, // EOF — shell exited
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let mut g = grid_clone.lock().unwrap();
                     for &byte in &buf[..n] {
                         parser.advance(&mut *g, byte);
                     }
                 }
-                Err(e) => {
-                    eprintln!("[fermi-term] PTY read error: {}", e);
-                    break;
-                }
             }
         }
-
-        eprintln!("[fermi-term] Shell exited. Close the window to quit.");
+        eprintln!("[fermi-term] Shell exited.");
     });
 
-    // --- Create minifb window ---
-    let mut window = Window::new(
-        "fermi-term",
-        WIN_W,
-        WIN_H,
-        WindowOptions {
-            resize: false,
-            ..WindowOptions::default()
-        },
-    )
-    .expect("Failed to create window");
+    // ── Create window & renderer ──────────────────────────────────────
+    let event_loop = EventLoop::new().expect("Failed to create event loop");
 
-    window.limit_update_rate(None); // We manage our own frame rate
+    let window = WindowBuilder::new()
+        .with_title("fermi-term ⚡")
+        .with_inner_size(winit::dpi::PhysicalSize::new(
+            config.window_width,
+            config.window_height,
+        ))
+        .build(&event_loop)
+        .expect("Failed to create window");
+    let window = Arc::new(window);
 
-    let mut pixel_buffer = vec![0u32; WIN_W * WIN_H];
+    let mut renderer_instance =
+        pollster::block_on(renderer::Renderer::new(Arc::clone(&window), &config));
 
-    // --- Main event loop ---
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        let frame_start = Instant::now();
+    let cell_w = renderer_instance.cell_w;
+    let cell_h = renderer_instance.cell_h;
 
-        // --- Keyboard input ---
-        let ctrl_down = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-        let shift_down = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
-
-        let keys = window.get_keys_pressed(KeyRepeat::Yes);
-        let mut input_bytes: Vec<u8> = Vec::new();
-
-        for key in keys {
-            let bytes = key_to_bytes(key, ctrl_down, shift_down);
-            input_bytes.extend_from_slice(&bytes);
-        }
-
-        if !input_bytes.is_empty() {
-            if let Ok(mut writer) = pty_writer.lock() {
-                let _ = writer.write_all(&input_bytes);
-            }
-        }
-
-        // --- Render ---
-        {
-            let g = grid.lock().unwrap();
-            renderer.render(&g, &mut pixel_buffer, WIN_W, WIN_H);
-        }
-
-        window
-            .update_with_buffer(&pixel_buffer, WIN_W, WIN_H)
-            .expect("Failed to update window buffer");
-
-        // --- Frame rate cap ---
-        let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_DURATION {
-            std::thread::sleep(FRAME_DURATION - elapsed);
-        }
+    // Resize grid to actual window size
+    {
+        let size = window.inner_size();
+        let cols = (size.width as usize / cell_w).max(1);
+        let rows = (size.height as usize / cell_h).max(1);
+        let mut g = grid.lock().unwrap();
+        g.resize(cols, rows);
     }
-}
 
-/// Map a minifb Key + modifier state to the bytes to send to the PTY.
-fn key_to_bytes(key: Key, ctrl: bool, shift: bool) -> Vec<u8> {
-    // Ctrl+key shortcuts
-    if ctrl {
-        match key {
-            Key::C => return vec![0x03],
-            Key::D => return vec![0x04],
-            Key::L => return vec![0x0c],
-            Key::Z => return vec![0x1a],
-            Key::A => return vec![0x01],
-            Key::E => return vec![0x05],
-            Key::K => return vec![0x0b],
-            Key::U => return vec![0x15],
-            Key::W => return vec![0x17],
-            Key::R => return vec![0x12],
+    let pty_writer_shared: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pty_writer));
+    let master_shared: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+        Arc::new(Mutex::new(master));
+
+    let mut modifiers = ModifiersState::default();
+
+    // ── Event loop (winit 0.29 API) ───────────────────────────────────
+    let _ = event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
+
+        match event {
+            Event::WindowEvent { event, .. } => match event {
+                WindowEvent::CloseRequested => {
+                    elwt.exit();
+                }
+
+                WindowEvent::Resized(size) => {
+                    renderer_instance.resize(size.width, size.height);
+                    let new_cols = (size.width as usize / cell_w).max(1);
+                    let new_rows = (size.height as usize / cell_h).max(1);
+                    {
+                        let mut g = grid.lock().unwrap();
+                        g.resize(new_cols, new_rows);
+                    }
+                    let _ = master_shared.lock().unwrap().resize(PtySize {
+                        rows: new_rows as u16,
+                        cols: new_cols as u16,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+
+                WindowEvent::ModifiersChanged(mods) => {
+                    modifiers = mods.state();
+                }
+
+                WindowEvent::KeyboardInput {
+                    event:
+                        KeyEvent {
+                            state: ElementState::Pressed,
+                            logical_key,
+                            ..
+                        },
+                    ..
+                } => {
+                    let bytes = key_to_bytes(&logical_key, modifiers);
+                    if !bytes.is_empty() {
+                        grid.lock().unwrap().scroll_to_bottom();
+                        let _ = pty_writer_shared.lock().unwrap().write_all(&bytes);
+                    }
+                }
+
+                WindowEvent::MouseWheel { delta, .. } => {
+                    let lines: isize = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (-(y as isize)) * 3,
+                        MouseScrollDelta::PixelDelta(pos) => -(pos.y as isize) / 10,
+                    };
+                    grid.lock().unwrap().scroll_view(lines);
+                    window.request_redraw();
+                }
+
+                WindowEvent::RedrawRequested => {
+                    let g = grid.lock().unwrap();
+                    renderer_instance.render(&g);
+                }
+
+                _ => {}
+            },
+
+            Event::AboutToWait => {
+                window.request_redraw();
+            }
+
             _ => {}
         }
-    }
-
-    // Special keys
-    match key {
-        Key::Enter | Key::NumPadEnter => return vec![b'\r'],
-        Key::Backspace => return vec![0x7f],
-        Key::Tab => return vec![b'\t'],
-        Key::Up => return b"\x1b[A".to_vec(),
-        Key::Down => return b"\x1b[B".to_vec(),
-        Key::Right => return b"\x1b[C".to_vec(),
-        Key::Left => return b"\x1b[D".to_vec(),
-        Key::Home => return b"\x1b[H".to_vec(),
-        Key::End => return b"\x1b[F".to_vec(),
-        Key::PageUp => return b"\x1b[5~".to_vec(),
-        Key::PageDown => return b"\x1b[6~".to_vec(),
-        Key::Delete => return b"\x1b[3~".to_vec(),
-        Key::Insert => return b"\x1b[2~".to_vec(),
-        Key::F1 => return b"\x1bOP".to_vec(),
-        Key::F2 => return b"\x1bOQ".to_vec(),
-        Key::F3 => return b"\x1bOR".to_vec(),
-        Key::F4 => return b"\x1bOS".to_vec(),
-        Key::F5 => return b"\x1b[15~".to_vec(),
-        Key::F6 => return b"\x1b[17~".to_vec(),
-        Key::F7 => return b"\x1b[18~".to_vec(),
-        Key::F8 => return b"\x1b[19~".to_vec(),
-        Key::F9 => return b"\x1b[20~".to_vec(),
-        Key::F10 => return b"\x1b[21~".to_vec(),
-        Key::F11 => return b"\x1b[23~".to_vec(),
-        Key::F12 => return b"\x1b[24~".to_vec(),
-        _ => {}
-    }
-
-    // Printable characters
-    let ch = key_to_char(key, shift);
-    if let Some(c) = ch {
-        let mut buf = [0u8; 4];
-        let s = c.encode_utf8(&mut buf);
-        return s.as_bytes().to_vec();
-    }
-
-    vec![]
+    });
 }
 
-/// Convert a Key to its character representation, accounting for shift.
-fn key_to_char(key: Key, shift: bool) -> Option<char> {
+fn key_to_bytes(key: &Key, mods: ModifiersState) -> Vec<u8> {
+    let ctrl = mods.control_key();
+    let shift = mods.shift_key();
+
+    // Ctrl shortcuts
+    if ctrl {
+        if let Key::Character(s) = key {
+            return match s.as_str() {
+                "c" | "C" => vec![0x03],
+                "d" | "D" => vec![0x04],
+                "l" | "L" => vec![0x0c],
+                "z" | "Z" => vec![0x1a],
+                "a" | "A" => vec![0x01],
+                "e" | "E" => vec![0x05],
+                "k" | "K" => vec![0x0b],
+                "u" | "U" => vec![0x15],
+                "w" | "W" => vec![0x17],
+                "r" | "R" => vec![0x12],
+                _ => vec![],
+            };
+        }
+    }
+
     match key {
-        Key::Space => Some(' '),
-        Key::A => Some(if shift { 'A' } else { 'a' }),
-        Key::B => Some(if shift { 'B' } else { 'b' }),
-        Key::C => Some(if shift { 'C' } else { 'c' }),
-        Key::D => Some(if shift { 'D' } else { 'd' }),
-        Key::E => Some(if shift { 'E' } else { 'e' }),
-        Key::F => Some(if shift { 'F' } else { 'f' }),
-        Key::G => Some(if shift { 'G' } else { 'g' }),
-        Key::H => Some(if shift { 'H' } else { 'h' }),
-        Key::I => Some(if shift { 'I' } else { 'i' }),
-        Key::J => Some(if shift { 'J' } else { 'j' }),
-        Key::K => Some(if shift { 'K' } else { 'k' }),
-        Key::L => Some(if shift { 'L' } else { 'l' }),
-        Key::M => Some(if shift { 'M' } else { 'm' }),
-        Key::N => Some(if shift { 'N' } else { 'n' }),
-        Key::O => Some(if shift { 'O' } else { 'o' }),
-        Key::P => Some(if shift { 'P' } else { 'p' }),
-        Key::Q => Some(if shift { 'Q' } else { 'q' }),
-        Key::R => Some(if shift { 'R' } else { 'r' }),
-        Key::S => Some(if shift { 'S' } else { 's' }),
-        Key::T => Some(if shift { 'T' } else { 't' }),
-        Key::U => Some(if shift { 'U' } else { 'u' }),
-        Key::V => Some(if shift { 'V' } else { 'v' }),
-        Key::W => Some(if shift { 'W' } else { 'w' }),
-        Key::X => Some(if shift { 'X' } else { 'x' }),
-        Key::Y => Some(if shift { 'Y' } else { 'y' }),
-        Key::Z => Some(if shift { 'Z' } else { 'z' }),
-        Key::Key0 => Some(if shift { ')' } else { '0' }),
-        Key::Key1 => Some(if shift { '!' } else { '1' }),
-        Key::Key2 => Some(if shift { '@' } else { '2' }),
-        Key::Key3 => Some(if shift { '#' } else { '3' }),
-        Key::Key4 => Some(if shift { '$' } else { '4' }),
-        Key::Key5 => Some(if shift { '%' } else { '5' }),
-        Key::Key6 => Some(if shift { '^' } else { '6' }),
-        Key::Key7 => Some(if shift { '&' } else { '7' }),
-        Key::Key8 => Some(if shift { '*' } else { '8' }),
-        Key::Key9 => Some(if shift { '(' } else { '9' }),
-        Key::Minus => Some(if shift { '_' } else { '-' }),
-        Key::Equal => Some(if shift { '+' } else { '=' }),
-        Key::LeftBracket => Some(if shift { '{' } else { '[' }),
-        Key::RightBracket => Some(if shift { '}' } else { ']' }),
-        Key::Backslash => Some(if shift { '|' } else { '\\' }),
-        Key::Semicolon => Some(if shift { ':' } else { ';' }),
-        Key::Apostrophe => Some(if shift { '"' } else { '\'' }),
-        Key::Comma => Some(if shift { '<' } else { ',' }),
-        Key::Period => Some(if shift { '>' } else { '.' }),
-        Key::Slash => Some(if shift { '?' } else { '/' }),
-        Key::Backquote => Some(if shift { '~' } else { '`' }),
-        Key::NumPad0 => Some('0'),
-        Key::NumPad1 => Some('1'),
-        Key::NumPad2 => Some('2'),
-        Key::NumPad3 => Some('3'),
-        Key::NumPad4 => Some('4'),
-        Key::NumPad5 => Some('5'),
-        Key::NumPad6 => Some('6'),
-        Key::NumPad7 => Some('7'),
-        Key::NumPad8 => Some('8'),
-        Key::NumPad9 => Some('9'),
-        Key::NumPadDot => Some('.'),
-        Key::NumPadSlash => Some('/'),
-        Key::NumPadAsterisk => Some('*'),
-        Key::NumPadMinus => Some('-'),
-        Key::NumPadPlus => Some('+'),
-        _ => None,
+        Key::Named(NamedKey::Enter) => vec![b'\r'],
+        Key::Named(NamedKey::Backspace) => vec![0x7f],
+        Key::Named(NamedKey::Tab) => vec![b'\t'],
+        Key::Named(NamedKey::ArrowUp) => b"\x1b[A".to_vec(),
+        Key::Named(NamedKey::ArrowDown) => b"\x1b[B".to_vec(),
+        Key::Named(NamedKey::ArrowRight) => b"\x1b[C".to_vec(),
+        Key::Named(NamedKey::ArrowLeft) => b"\x1b[D".to_vec(),
+        Key::Named(NamedKey::Home) => b"\x1b[H".to_vec(),
+        Key::Named(NamedKey::End) => b"\x1b[F".to_vec(),
+        Key::Named(NamedKey::PageUp) => b"\x1b[5~".to_vec(),
+        Key::Named(NamedKey::PageDown) => b"\x1b[6~".to_vec(),
+        Key::Named(NamedKey::Delete) => b"\x1b[3~".to_vec(),
+        Key::Named(NamedKey::Insert) => b"\x1b[2~".to_vec(),
+        Key::Named(NamedKey::Escape) => vec![0x1b],
+        Key::Named(NamedKey::F1) => b"\x1bOP".to_vec(),
+        Key::Named(NamedKey::F2) => b"\x1bOQ".to_vec(),
+        Key::Named(NamedKey::F3) => b"\x1bOR".to_vec(),
+        Key::Named(NamedKey::F4) => b"\x1bOS".to_vec(),
+        Key::Named(NamedKey::F5) => b"\x1b[15~".to_vec(),
+        Key::Named(NamedKey::F6) => b"\x1b[17~".to_vec(),
+        Key::Named(NamedKey::F7) => b"\x1b[18~".to_vec(),
+        Key::Named(NamedKey::F8) => b"\x1b[19~".to_vec(),
+        Key::Named(NamedKey::F9) => b"\x1b[20~".to_vec(),
+        Key::Named(NamedKey::F10) => b"\x1b[21~".to_vec(),
+        Key::Named(NamedKey::F11) => b"\x1b[23~".to_vec(),
+        Key::Named(NamedKey::F12) => b"\x1b[24~".to_vec(),
+        Key::Named(NamedKey::Space) => vec![b' '],
+        Key::Character(s) => {
+            let s = if shift {
+                s.to_uppercase().to_string()
+            } else {
+                s.to_string()
+            };
+            s.into_bytes()
+        }
+        _ => vec![],
     }
 }
